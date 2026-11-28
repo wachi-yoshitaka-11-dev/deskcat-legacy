@@ -101,7 +101,16 @@ if fixture.get("fail"):
     sys.exit(1)
 args = sys.argv[1:]
 if args[:2] == ["pr", "view"]:
-    print(json.dumps({{"number": 7, "url": "https://github.com/o/r/pull/7"}}))
+    # base と head を指定しない fixture では、どちらも作業ツリーの HEAD にする。
+    # merge-base と head が同じなので、レビューの記録の検査（#814 の作業リストの9）は
+    # 範囲を要さずに通る。記録の検査そのものは ReviewCoverageMergeTests が見る。
+    import subprocess
+    here = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout.strip()
+    print(json.dumps({{"number": 7, "url": "https://github.com/o/r/pull/7",
+                      "baseRefOid": fixture.get("base", here),
+                      "headRefOid": fixture.get("head", here),
+                      "body": fixture.get("body", "")}}))
 elif args[:2] == ["issue", "view"]:
     print(json.dumps(fixture["issue"]))
 elif args[:2] == ["api", "graphql"]:
@@ -110,6 +119,14 @@ elif args[0] == "api":
     path = [a for a in args[1:] if a.startswith("repos/")][0]
     if path.startswith("repos/o/r/pulls/7/files"):
         print("\\n".join(fixture.get("files", ["README.md"])))
+    elif path.startswith("repos/o/r/issues/7/comments"):
+        # 指定が無ければ、head の SHA を書いた承認のコメントが1件ある扱いにする。
+        import subprocess
+        here = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        default = ["承認 " + fixture.get("head", here)]
+        print(json.dumps([[{{"user": {{"type": "User"}}, "body": body}}
+                           for body in fixture.get("comments", default)]]))
     elif path.startswith("repos/o/r/pulls/7/commits"):
         print("\\n".join(fixture.get("commits", {{}}).keys()))
     elif "/check-runs" in path:
@@ -145,6 +162,10 @@ def _invoke(script, command, cwd=None, environment=None):
     env.pop("DESKCAT_TEST_GH", None)
     if script in (GH_GUARD, CODERABBIT_GATE):
         env["PATH"] = f"{_GH_SHIM_DIR}{os.pathsep}{env['PATH']}"
+    if script == GH_GUARD and cwd is None:
+        # `gh pr merge` の検査は、手元の git で base と head を照らす（#814 の作業リストの9）。
+        # CI は test を repository の外（`runner.temp`）で走らせるので、repository の中で走らせる。
+        cwd = str(REPO_ROOT_FOR_TEMPLATES)
     if environment:
         env.update(environment)
     result = subprocess.run(
@@ -530,14 +551,28 @@ class GhMetadataGuardTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIsNone(output)
 
-    def test_broken_input_does_not_block(self):
-        """hookの入力やcommandが壊れていることを、対象commandの問題として扱わない。"""
+    def test_unreadable_input_blocks_and_broken_command_does_not(self):
+        """読めない入力は exit 2 で止める（前は通していた。#814 の作業リストの9）。"""
         result = subprocess.run(
             [sys.executable, GH_GUARD], input="{ではないJSON",
-            capture_output=True, text=True, encoding="utf-8", timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("gh_metadata_guard", result.stderr)
+        # 既定の文字コードが cp932 でも、UTF-8 の日本語の command を読んで検査する。
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {
+            "command": 'gh pr merge 7 --squash --subject "日本語の件名 ✓"'}}, ensure_ascii=False)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("DESKCAT_")}
+        env.update({"PYTHONIOENCODING": "cp932", "PYTHONUTF8": "0",
+                    "PATH": f"{_GH_SHIM_DIR}{os.pathsep}{env['PATH']}"})
+        result = subprocess.run(
+            [sys.executable, GH_GUARD], input=payload.encode("utf-8"), capture_output=True,
+            timeout=120, env=env, cwd=str(REPO_ROOT_FOR_TEMPLATES),
+        )
+        # 本文が無い merge なので、入力を読めていれば deny になる（前は読めずに何も出さずに通した）。
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "")
+        decision = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
         # 引用符が閉じていないcommandは、shell自身が落とす。ここで二重に報告しない。
         self.assertAllowed('gh pr create --title "閉じていない')
 
